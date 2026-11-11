@@ -3,9 +3,7 @@
   "name": "AudioTube",
   "version": "0.1.0",
   "description": "YouTube: odtwarzaj tylko dźwięk i nie pobieraj wideo.",
-  "permissions": ["storage", "declarativeNetRequest"],
-  "host_permissions": ["*://*.youtube.com/*", "*://*.googlevideo.com/*"],
-  "background": { "service_worker": "src/background.js" },
+  "permissions": ["storage"],
   "action": { "default_popup": "popup/popup.html", "default_title": "AudioTube" },
   "content_scripts": [
     {
@@ -21,10 +19,5 @@
       "run_at": "document_start",
       "all_frames": true
     }
-  ],
-  "declarative_net_request": {
-    "rule_resources": [
-      { "id": "block_video", "enabled": false, "path": "rules/block_video.json" }
-    ]
-  }
+  ]
 }
