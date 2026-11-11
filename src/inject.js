@@ -1,59 +1,83 @@
-// AudioTube – MAIN world.
-// Podejście "atrapa wideo": player dostaje normalne formaty (więc nie zgłasza błędu),
-// ale zamiast prawdziwego bufora wideo MediaSource dostaje atrapę, która ignoruje dane
-// i zawsze raportuje "wszystko zbuforowane" – player nie ma po co pobierać kolejnych segmentów wideo.
+// AudioTube – runs in the page's MAIN world at document_start.
+//
+// Two mechanisms make YouTube play audio without downloading video:
+//
+// 1. SABR request patch. The web player streams media with SABR: a POST to
+//    googlevideo.com/videoplayback?...&sabr=1 whose body is a protobuf
+//    VideoPlaybackAbrRequest. Its ClientAbrState (field 1) carries
+//    enabled_track_types_bitfield (field 40; observed value 3 = audio|video).
+//    Setting it to 1 makes the server send audio segments only.
+//    Field numbers are reverse-engineered, not an official schema.
+//
+// 2. Fake video SourceBuffer. The player still believes it is playing video,
+//    so it creates a video SourceBuffer. We hand it a stub that accepts and
+//    discards data and reports the whole duration as buffered, so the player
+//    neither stalls nor errors out while waiting for video.
 (() => {
-  const KEY = 'audiotube_enabled';
+  'use strict';
+
   const TAG = '[AudioTube]';
-  const enabled = () => {
-    try { return localStorage.getItem(KEY) !== '0'; } catch { return true; }
+
+  const readFlag = (key, fallback) => {
+    try {
+      const v = localStorage.getItem(key);
+      return v === null ? fallback : v === '1';
+    } catch {
+      return fallback;
+    }
   };
-  // Diagnostyka: w konsoli strony wpisz localStorage.audiotube_debug = '1' i odśwież.
-  const debug = () => {
-    try { return localStorage.getItem('audiotube_debug') === '1'; } catch { return false; }
+  // Kept in sync with chrome.storage by bridge.js.
+  const enabled = () => readFlag('audiotube_enabled', true);
+  // Set localStorage.audiotube_debug = '1' in the page console and reload.
+  const debug = () => readFlag('audiotube_debug', false);
+
+  const warned = new Set();
+  const warnOnce = (msg, ...rest) => {
+    if (warned.has(msg)) return;
+    warned.add(msg);
+    console.warn(TAG, msg, ...rest);
   };
-  const isVideoType = (t) => typeof t === 'string' && /^video\//i.test(t);
 
   if (!window.MediaSource) return;
 
-  // --- Atrapa SourceBuffer ----------------------------------------------
-  const EVENT_HANDLERS = ['onabort', 'onerror', 'onupdate', 'onupdateend', 'onupdatestart'];
+  // ---------------------------------------------------------------------------
+  // Fake video SourceBuffer
+  // ---------------------------------------------------------------------------
+
+  const HANDLER_EVENTS = ['abort', 'error', 'update', 'updateend', 'updatestart'];
 
   class FakeSourceBuffer extends EventTarget {
-    constructor(mediaSource, type) {
+    constructor(mediaSource) {
       super();
-      this._ms = mediaSource;
-      this._type = type;
+      this._mediaSource = mediaSource;
       this._updating = false;
-      this._appends = 0;
+      this._handlers = {};
       this.mode = 'segments';
       this.timestampOffset = 0;
       this.appendWindowStart = 0;
       this.appendWindowEnd = Infinity;
-      EVENT_HANDLERS.forEach((name) => {
-        let handler = null;
-        const evt = name.slice(2);
-        Object.defineProperty(this, name, {
-          get: () => handler,
-          set: (fn) => {
-            if (handler) this.removeEventListener(evt, handler);
-            handler = fn;
-            if (fn) this.addEventListener(evt, fn);
-          },
-        });
-      });
     }
-    get updating() { return this._updating; }
+
+    get updating() {
+      return this._updating;
+    }
+
+    // Report [0, duration] as buffered. Empty when duration is not finite
+    // (e.g. live streams).
     get buffered() {
-      const d = this._ms.duration;
+      const d = this._mediaSource.duration;
       const end = Number.isFinite(d) && d > 0 ? d : 0;
+      const check = (i) => {
+        if (i !== 0 || !end) throw new DOMException('Index out of range', 'IndexSizeError');
+      };
       return {
         length: end ? 1 : 0,
-        start: (i) => { if (i !== 0 || !end) throw new DOMException('index', 'IndexSizeError'); return 0; },
-        end: (i) => { if (i !== 0 || !end) throw new DOMException('index', 'IndexSizeError'); return end; },
+        start: (i) => (check(i), 0),
+        end: (i) => (check(i), end),
       };
     }
-    _fakeUpdate() {
+
+    _completeAsync() {
       this._updating = true;
       this.dispatchEvent(new Event('updatestart'));
       setTimeout(() => {
@@ -62,84 +86,224 @@
         this.dispatchEvent(new Event('updateend'));
       }, 0);
     }
-    appendBuffer() { this._appends++; this._fakeUpdate(); }
-    appendStream() { this._fakeUpdate(); }
-    remove() { this._fakeUpdate(); }
+
+    appendBuffer() { this._completeAsync(); }
+    remove() { this._completeAsync(); }
     abort() { this._updating = false; }
-    changeType(type) { this._type = type; }
+    changeType() {}
   }
 
-  // --- Hooki MediaSource -------------------------------------------------
-  const isSupported = MediaSource.isTypeSupported.bind(MediaSource);
-  const origAdd = MediaSource.prototype.addSourceBuffer;
+  // onupdateend & co. as accessors wired to addEventListener.
+  for (const evt of HANDLER_EVENTS) {
+    Object.defineProperty(FakeSourceBuffer.prototype, 'on' + evt, {
+      get() { return this._handlers[evt] || null; },
+      set(fn) {
+        if (this._handlers[evt]) this.removeEventListener(evt, this._handlers[evt]);
+        this._handlers[evt] = typeof fn === 'function' ? fn : null;
+        if (this._handlers[evt]) this.addEventListener(evt, this._handlers[evt]);
+      },
+    });
+  }
 
+  const nativeAddSourceBuffer = MediaSource.prototype.addSourceBuffer;
   MediaSource.prototype.addSourceBuffer = function (type) {
-    if (enabled() && isVideoType(type)) {
-      console.log(TAG, 'atrapa SourceBuffer dla', type);
-      return new FakeSourceBuffer(this, type);
+    if (enabled() && typeof type === 'string' && /^video\//i.test(type)) {
+      if (debug()) console.log(TAG, 'fake SourceBuffer for', type);
+      return new FakeSourceBuffer(this);
     }
-    return origAdd.apply(this, arguments);
+    return nativeAddSourceBuffer.apply(this, arguments);
   };
 
-  // --- Diagnostyka: co jeszcze leci z googlevideo ------------------------
-  const xhrOpen = XMLHttpRequest.prototype.open;
-  XMLHttpRequest.prototype.open = function (method, url) {
-    try {
-      if (typeof url === 'string' && url.includes('/videoplayback')) {
-        const u = new URL(url, location.href);
-        if (debug()) console.log(TAG, 'videoplayback',
-          'itag=' + u.searchParams.get('itag'),
-          'mime=' + u.searchParams.get('mime'),
-          'range=' + u.searchParams.get('range'));
-      }
-    } catch (e) { /* ignoruj */ }
-    return xhrOpen.apply(this, arguments);
-  };
+  // ---------------------------------------------------------------------------
+  // Minimal protobuf reader/writer
+  // ---------------------------------------------------------------------------
 
-  // --- SABR: wymuś "tylko audio" w ClientAbrState ------------------------
-  // VideoPlaybackAbrRequest (nieoficjalny schemat): pole 1 = ClientAbrState,
-  // w nim pole 40 (varint) = enabled_track_types_bitfield: 0 audio+wideo, 1 tylko audio, 2 tylko wideo.
+  // Returns [value, nextPos] or null. Values above 2^53 lose precision, which
+  // is fine: we only interpret tags, lengths and small enums.
   function readVarint(buf, pos) {
-    let result = 0, shift = 0;
-    for (;;) {
+    let value = 0;
+    for (let shift = 0; shift < 64; shift += 7) {
       if (pos >= buf.length) return null;
       const b = buf[pos++];
-      result += (b & 0x7f) * Math.pow(2, shift); // Number wystarcza dla tagów i długości
-      if (!(b & 0x80)) return [result, pos];
-      shift += 7;
-      if (shift > 63) return null;
+      value += (b & 0x7f) * 2 ** shift;
+      if (!(b & 0x80)) return [value, pos];
     }
+    return null;
   }
+
   function writeVarint(n) {
     const out = [];
-    while (n >= 0x80) { out.push((n % 0x80) | 0x80); n = Math.floor(n / 0x80); }
+    while (n >= 0x80) {
+      out.push((n % 0x80) | 0x80);
+      n = Math.floor(n / 0x80);
+    }
     out.push(n);
     return Uint8Array.from(out);
   }
-  // Zwraca listę pól { num, wire, start, end, dataStart, dataEnd } albo null przy błędzie.
+
+  // Splits a message into fields without decoding values.
+  // Each field: { num, wire, start, end, dataStart, dataEnd }. null on error.
   function parseFields(buf) {
     const fields = [];
     let pos = 0;
     while (pos < buf.length) {
       const start = pos;
-      const tag = readVarint(buf, pos); if (!tag) return null;
+      const tag = readVarint(buf, pos);
+      if (!tag) return null;
       pos = tag[1];
-      const num = Math.floor(tag[0] / 8), wire = tag[0] % 8;
-      let dataStart = pos, dataEnd;
-      if (wire === 0) { const v = readVarint(buf, pos); if (!v) return null; dataEnd = v[1]; }
-      else if (wire === 1) dataEnd = pos + 8;
-      else if (wire === 5) dataEnd = pos + 4;
-      else if (wire === 2) {
-        const l = readVarint(buf, pos); if (!l) return null;
-        dataStart = l[1]; dataEnd = dataStart + l[0];
-      } else return null; // grupy – nieobsługiwane
+      const num = Math.floor(tag[0] / 8);
+      const wire = tag[0] % 8;
+      let dataStart = pos;
+      let dataEnd;
+      if (wire === 0) {
+        const v = readVarint(buf, pos);
+        if (!v) return null;
+        dataEnd = v[1];
+      } else if (wire === 1) {
+        dataEnd = pos + 8;
+      } else if (wire === 5) {
+        dataEnd = pos + 4;
+      } else if (wire === 2) {
+        const len = readVarint(buf, pos);
+        if (!len) return null;
+        dataStart = len[1];
+        dataEnd = dataStart + len[0];
+      } else {
+        return null; // groups are not used by this message
+      }
       if (dataEnd > buf.length) return null;
       fields.push({ num, wire, start, end: dataEnd, dataStart, dataEnd });
       pos = dataEnd;
     }
     return fields;
   }
-  // Diagnostyka: czytelny zrzut struktury protobuf (zagnieżdżone wiadomości rozpoznawane heurystycznie).
+
+  function concat(parts) {
+    const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+    let offset = 0;
+    for (const p of parts) {
+      out.set(p, offset);
+      offset += p.length;
+    }
+    return out;
+  }
+
+  // ---------------------------------------------------------------------------
+  // SABR request patch
+  // ---------------------------------------------------------------------------
+
+  const CLIENT_ABR_STATE = 1;
+  const ENABLED_TRACK_TYPES = 40;
+  const TRACK_TYPES_AUDIO_ONLY = 1;
+  // Tag (field 40, wire type 0) followed by the value.
+  const ENABLED_TRACK_TYPES_FIELD = concat([writeVarint(ENABLED_TRACK_TYPES * 8), [TRACK_TYPES_AUDIO_ONLY]]);
+
+  // Returns a patched copy of a VideoPlaybackAbrRequest body, or null if it
+  // cannot be parsed.
+  function patchSabrBody(bytes) {
+    const top = parseFields(bytes);
+    if (!top) return null;
+
+    const abr = top.find((f) => f.num === CLIENT_ABR_STATE && f.wire === 2);
+    if (!abr) {
+      // No ClientAbrState at all – prepend one holding only our field.
+      return concat([
+        writeVarint(CLIENT_ABR_STATE * 8 + 2),
+        writeVarint(ENABLED_TRACK_TYPES_FIELD.length),
+        ENABLED_TRACK_TYPES_FIELD,
+        bytes,
+      ]);
+    }
+
+    const inner = bytes.subarray(abr.dataStart, abr.dataEnd);
+    const fields = parseFields(inner);
+    if (!fields) return null;
+
+    const isTrackTypes = (f) => f.num === ENABLED_TRACK_TYPES && f.wire === 0;
+    const existing = fields.find(isTrackTypes);
+
+    // Common case: overwrite the single value byte in place. Size-preserving.
+    if (existing && existing.dataEnd - existing.dataStart === 1) {
+      const out = bytes.slice();
+      out[abr.dataStart + existing.dataStart] = TRACK_TYPES_AUDIO_ONLY;
+      return out;
+    }
+
+    // Otherwise rebuild ClientAbrState with the field replaced or appended.
+    const newInner = concat([
+      ...fields.filter((f) => !isTrackTypes(f)).map((f) => inner.subarray(f.start, f.end)),
+      ENABLED_TRACK_TYPES_FIELD,
+    ]);
+    return concat([
+      bytes.subarray(0, abr.start),
+      writeVarint(CLIENT_ABR_STATE * 8 + 2),
+      writeVarint(newInner.length),
+      newInner,
+      bytes.subarray(abr.end),
+    ]);
+  }
+
+  function toBytes(body) {
+    if (body instanceof ArrayBuffer) return new Uint8Array(body);
+    if (ArrayBuffer.isView(body)) return new Uint8Array(body.buffer, body.byteOffset, body.byteLength);
+    return null;
+  }
+
+  function isSabrRequest(input) {
+    try {
+      const raw = input instanceof Request ? input.url : String(input);
+      if (!raw.includes('/videoplayback')) return false;
+      return new URL(raw, location.href).searchParams.get('sabr') === '1';
+    } catch {
+      return false;
+    }
+  }
+
+  const nativeFetch = window.fetch;
+
+  async function fetchPatched(input, init) {
+    let request = input;
+    let options = init;
+    try {
+      if (options && options.body != null) {
+        const bytes = toBytes(options.body);
+        const patched = bytes && patchSabrBody(bytes);
+        if (patched) {
+          debugDumpRequest(bytes);
+          options = { ...options, body: patched };
+        } else {
+          warnOnce('Could not patch SABR request body; video may still be downloaded.');
+        }
+      } else if (input instanceof Request) {
+        const bytes = new Uint8Array(await input.clone().arrayBuffer());
+        const patched = patchSabrBody(bytes);
+        if (patched) {
+          debugDumpRequest(bytes);
+          request = new Request(input, { body: patched });
+        } else {
+          warnOnce('Could not patch SABR request body; video may still be downloaded.');
+        }
+      }
+    } catch (e) {
+      warnOnce('SABR patch failed; video may still be downloaded.', e);
+    }
+
+    const response = await nativeFetch.call(window, request, options);
+    if (debug()) debugLogResponse(response);
+    return response;
+  }
+
+  window.fetch = function (input, init) {
+    if (enabled() && isSabrRequest(input)) return fetchPatched(input, init);
+    return nativeFetch.apply(this, arguments);
+  };
+
+  // ---------------------------------------------------------------------------
+  // Debug helpers (only active with localStorage.audiotube_debug = '1')
+  // ---------------------------------------------------------------------------
+
+  // Compact structural dump of a protobuf message, e.g. "1:{18=1042,40=3},5:len80".
+  // Nested messages are detected heuristically.
   function dumpFields(buf, depth) {
     const fields = parseFields(buf);
     if (!fields) return null;
@@ -148,158 +312,76 @@
       if (f.wire === 2) {
         const sub = buf.subarray(f.dataStart, f.dataEnd);
         const nested = depth > 0 && sub.length ? dumpFields(sub, depth - 1) : null;
-        return f.num + (nested && nested.length ? ':{' + nested + '}' : ':len' + sub.length);
+        return f.num + (nested ? ':{' + nested + '}' : ':len' + sub.length);
       }
       return f.num + '~w' + f.wire;
     }).join(',');
   }
-  let dumps = 0;
 
-  // Diagnostyka: analiza odpowiedzi UMP (bajty per itag).
+  let requestDumps = 0;
+  function debugDumpRequest(bytes) {
+    if (!debug() || requestDumps >= 3) return;
+    requestDumps++;
+    console.log(TAG, 'SABR request #' + requestDumps, dumpFields(bytes, 2));
+  }
+
+  // UMP (the SABR response framing) uses its own varint: the leading bits of
+  // the first byte give the total length (1–5 bytes).
   function readUmpVarint(buf, pos) {
     if (pos >= buf.length) return null;
     const b0 = buf[pos];
-    const size = b0 < 128 ? 1 : b0 < 192 ? 2 : b0 < 224 ? 3 : b0 < 240 ? 4 : 5;
+    const size = b0 < 0x80 ? 1 : b0 < 0xc0 ? 2 : b0 < 0xe0 ? 3 : b0 < 0xf0 ? 4 : 5;
     if (pos + size > buf.length) return null;
-    let val;
-    if (size === 1) val = b0;
-    else if (size === 5) {
-      val = (buf[pos + 1] | (buf[pos + 2] << 8) | (buf[pos + 3] << 16) | (buf[pos + 4] << 24)) >>> 0;
+    let value;
+    if (size === 1) {
+      value = b0;
+    } else if (size === 5) {
+      value = (buf[pos + 1] | (buf[pos + 2] << 8) | (buf[pos + 3] << 16) | (buf[pos + 4] << 24)) >>> 0;
     } else {
-      val = b0 & ((1 << (8 - size)) - 1);
+      value = b0 & ((1 << (8 - size)) - 1);
       let shift = 8 - size;
-      for (let i = 1; i < size; i++) { val += buf[pos + i] * Math.pow(2, shift); shift += 8; }
+      for (let i = 1; i < size; i++, shift += 8) value += buf[pos + i] * 2 ** shift;
     }
-    return [val, pos + size];
+    return [value, pos + size];
   }
+
+  const UMP_MEDIA_HEADER = 20; // protobuf: 1 = header_id, 3 = itag
+  const UMP_MEDIA = 21; // first byte = header_id, rest = media data
+
+  // Summarises a UMP response: total size, media bytes per itag, part counts.
   function analyzeUmp(buf) {
     const itagByHeader = {};
     const bytesByItag = {};
     const partCounts = {};
     let pos = 0;
     while (pos < buf.length) {
-      const t = readUmpVarint(buf, pos); if (!t) break;
-      const s = readUmpVarint(buf, t[1]); if (!s) break;
-      const payload = buf.subarray(s[1], s[1] + s[0]);
-      partCounts[t[0]] = (partCounts[t[0]] || 0) + 1;
-      if (t[0] === 20) { // MEDIA_HEADER: 1=header_id, 3=itag
-        const fs = parseFields(payload);
-        if (fs) {
-          const id = fs.find((f) => f.num === 1), itag = fs.find((f) => f.num === 3);
-          if (id && itag) itagByHeader[readVarint(payload, id.dataStart)[0]] = readVarint(payload, itag.dataStart)[0];
+      const type = readUmpVarint(buf, pos);
+      if (!type) break;
+      const size = readUmpVarint(buf, type[1]);
+      if (!size) break;
+      const payload = buf.subarray(size[1], size[1] + size[0]);
+      partCounts[type[0]] = (partCounts[type[0]] || 0) + 1;
+      if (type[0] === UMP_MEDIA_HEADER) {
+        const fields = parseFields(payload) || [];
+        const id = fields.find((f) => f.num === 1 && f.wire === 0);
+        const itag = fields.find((f) => f.num === 3 && f.wire === 0);
+        if (id && itag) {
+          itagByHeader[readVarint(payload, id.dataStart)[0]] = readVarint(payload, itag.dataStart)[0];
         }
-      } else if (t[0] === 21 && payload.length) { // MEDIA: pierwszy bajt = header_id
+      } else if (type[0] === UMP_MEDIA && payload.length) {
         const itag = itagByHeader[payload[0]];
         bytesByItag[itag] = (bytesByItag[itag] || 0) + payload.length - 1;
       }
-      pos = s[1] + s[0];
+      pos = size[1] + size[0];
     }
     return { total: buf.length, bytesByItag, partCounts };
   }
 
-  function concat(parts) {
-    const len = parts.reduce((s, p) => s + p.length, 0);
-    const out = new Uint8Array(len);
-    let o = 0;
-    for (const p of parts) { out.set(p, o); o += p.length; }
-    return out;
-  }
-  const AUDIO_ONLY_FIELD = Uint8Array.of(0xc0, 0x02, 0x01); // tag pola 40 (varint) + wartość 1
-
-  function patchSabrBody(bytes) {
-    const top = parseFields(bytes);
-    if (!top) return null;
-    const parts = [];
-    let patched = false;
-    for (const f of top) {
-      if (f.num === 1 && f.wire === 2 && !patched) {
-        const inner = bytes.subarray(f.dataStart, f.dataEnd);
-        const sub = parseFields(inner);
-        if (!sub) return null;
-        const innerParts = [];
-        for (const g of sub) {
-          if (g.num === 40 && g.wire === 0) continue; // usuń istniejące
-          innerParts.push(inner.subarray(g.start, g.end));
-        }
-        innerParts.push(AUDIO_ONLY_FIELD);
-        const newInner = concat(innerParts);
-        parts.push(Uint8Array.of(0x0a), writeVarint(newInner.length), newInner);
-        patched = true;
-      } else {
-        parts.push(bytes.subarray(f.start, f.end));
-      }
-    }
-    if (!patched) { // brak ClientAbrState – dodaj
-      parts.unshift(Uint8Array.of(0x0a), writeVarint(AUDIO_ONLY_FIELD.length), AUDIO_ONLY_FIELD);
-    }
-    return concat(parts);
-  }
-  function bodyToBytes(body) {
-    if (body instanceof Uint8Array) return body;
-    if (body instanceof ArrayBuffer) return new Uint8Array(body);
-    if (ArrayBuffer.isView(body)) return new Uint8Array(body.buffer, body.byteOffset, body.byteLength);
-    return null;
+  function debugLogResponse(response) {
+    response.clone().arrayBuffer()
+      .then((ab) => console.log(TAG, 'SABR response', JSON.stringify(analyzeUmp(new Uint8Array(ab)))))
+      .catch(() => {});
   }
 
-  let warnedRequestInput = false;
-  const origFetch = window.fetch;
-  window.fetch = function (input, init) {
-    try {
-      const url = typeof input === 'string' ? input : input && input.url;
-      if (url && url.includes('/videoplayback')) {
-        const u = new URL(url, location.href);
-        const sabr = u.searchParams.get('sabr');
-        if (debug()) console.log(TAG, 'fetch videoplayback',
-          'itag=' + u.searchParams.get('itag'),
-          'mime=' + u.searchParams.get('mime'),
-          'sabr=' + sabr);
-        if (sabr === '1' && enabled()) {
-          const bytes = init && init.body ? bodyToBytes(init.body) : null;
-          if (bytes) {
-            const patched = patchSabrBody(bytes);
-            if (patched) {
-              init = Object.assign({}, init, { body: patched });
-              console.log(TAG, 'SABR: wymuszono audio-only (', bytes.length, '->', patched.length, 'B )');
-            } else {
-              console.warn(TAG, 'SABR: nie udało się sparsować ciała żądania');
-            }
-          } else if (input instanceof Request && !(init && init.body)) {
-            // Player woła fetch(new Request(...)) – ciało siedzi w Requeście.
-            const req = input;
-            return (async () => {
-              let next = req;
-              try {
-                const buf = new Uint8Array(await req.clone().arrayBuffer());
-                if (debug() && dumps < 3) {
-                  dumps++;
-                  console.log(TAG, 'SABR dump #' + dumps, dumpFields(buf, 2));
-                }
-                const patched = patchSabrBody(buf);
-                if (patched) {
-                  next = new Request(req, { body: patched });
-                  console.log(TAG, 'SABR: wymuszono audio-only (Request,', buf.length, '->', patched.length, 'B )');
-                } else {
-                  console.warn(TAG, 'SABR: nie udało się sparsować ciała (Request), długość', buf.length);
-                }
-              } catch (e) { console.warn(TAG, 'SABR Request patch', e); }
-              const res = await origFetch.call(window, next, init);
-              if (debug()) {
-                res.clone().arrayBuffer().then((ab) => {
-                  try { console.log(TAG, 'SABR odpowiedź', JSON.stringify(analyzeUmp(new Uint8Array(ab)))); }
-                  catch (e) { console.warn(TAG, 'analyzeUmp', e); }
-                }).catch(() => {});
-              }
-              return res;
-            })();
-          } else if (!warnedRequestInput) {
-            warnedRequestInput = true;
-            console.warn(TAG, 'SABR: brak ciała do patchowania, init.body=' + (init && typeof init.body));
-          }
-        }
-      }
-    } catch (e) { console.warn(TAG, 'fetch hook', e); }
-    return origFetch.call(this, input, init);
-  };
-
-  console.log(TAG, 'zainicjalizowano, enabled =', enabled());
+  if (debug()) console.log(TAG, 'initialised, enabled =', enabled());
 })();
