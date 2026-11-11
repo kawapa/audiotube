@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "AudioTube",
   "version": "0.1.0",
-  "description": "YouTube: odtwarzaj tylko dźwięk i nie pobieraj wideo.",
+  "description": "Play YouTube as audio only, without downloading the video stream.",
   "permissions": ["storage"],
   "action": { "default_popup": "popup/popup.html", "default_title": "AudioTube" },
   "content_scripts": [
@@ -16,8 +16,7 @@
     {
       "matches": ["*://*.youtube.com/*"],
       "js": ["src/bridge.js"],
-      "run_at": "document_start",
-      "all_frames": true
+      "run_at": "document_start"
     }
   ]
 }
