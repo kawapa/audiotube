@@ -41,6 +41,10 @@ To measure traffic, filter the Network tab by `videoplayback` and read the "tran
 - The video area shows the player's placeholder instead of a picture.
 - Only tested on regular videos and playlists. Seeking, live streams and ads have not been tested.
 
+## License
+
+[MIT](LICENSE)
+
 ## Disclaimer
 
 Not affiliated with or endorsed by YouTube or Google. Intended for personal use. Modifying how the player works may conflict with YouTube's Terms of Service.
