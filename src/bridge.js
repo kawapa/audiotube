@@ -1,34 +1,33 @@
 // AudioTube – isolated content script.
 // Mirrors the extension setting (chrome.storage) into the page's localStorage,
-// where inject.js can read it synchronously at document_start.
+// where inject.js can read it synchronously at document_start, and reloads
+// the frame when the mode it is running in no longer matches the setting.
 const KEY = 'audiotube_enabled';
-const isTopFrame = window === window.top;
 
-// Returns true when the stored page value changed.
+// Returns true when the value was stored.
 function mirror(enabled) {
   try {
-    const next = enabled ? '1' : '0';
-    const current = localStorage.getItem(KEY) ?? '1'; // inject.js defaults to enabled
-    localStorage.setItem(KEY, next);
-    return current !== next;
+    localStorage.setItem(KEY, enabled ? '1' : '0');
+    return true;
   } catch {
     return false;
   }
 }
 
-// The hooks in inject.js are installed at page start, so a changed setting
-// only takes effect after a reload.
+// inject.js reads the setting once at page start and records the mode it
+// actually started in on <html>. Comparing against that (rather than against
+// localStorage, which is shared by every same-origin tab and frame) makes each
+// tab and frame reload itself when needed.
 function applyAndReload(enabled) {
-  if (mirror(enabled)) location.reload();
+  // If storage is unavailable a reload would not change anything (and would loop).
+  if (!mirror(enabled)) return;
+  const active = document.documentElement?.dataset.audiotubeActive;
+  if (active === undefined) return; // inject.js not active in this frame
+  if ((active === '1') !== enabled) location.reload();
 }
 
-// Same-origin frames share localStorage, so only the top frame writes it;
-// otherwise a frame could store the new value first and the top frame would
-// never see a change to reload for.
-if (isTopFrame) {
-  chrome.storage.local.get({ enabled: true }, ({ enabled }) => applyAndReload(enabled));
+chrome.storage.local.get({ enabled: true }, ({ enabled }) => applyAndReload(enabled));
 
-  chrome.storage.onChanged.addListener((changes, area) => {
-    if (area === 'local' && changes.enabled) applyAndReload(changes.enabled.newValue);
-  });
-}
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === 'local' && changes.enabled) applyAndReload(changes.enabled.newValue);
+});

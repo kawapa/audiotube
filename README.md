@@ -21,7 +21,7 @@ The protobuf field numbers are reverse-engineered, not taken from an official sc
 
 ## Usage
 
-Click the extension icon and toggle **Audio only**. Open YouTube tabs reload so the change takes effect. Audio only is on by default.
+Click the extension icon and toggle **Audio only**. Open YouTube tabs and embedded YouTube players reload so the change takes effect. Audio only is on by default.
 
 ## Debugging
 

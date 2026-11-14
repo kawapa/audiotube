@@ -26,8 +26,10 @@
       return fallback;
     }
   };
-  // Kept in sync with chrome.storage by bridge.js.
-  const enabled = () => readFlag('audiotube_enabled', true);
+  // Kept in sync with chrome.storage by bridge.js. Read once: the hooks below
+  // must behave consistently for the whole page lifetime, so a changed
+  // setting only takes effect after a reload (bridge.js triggers it).
+  const ENABLED = readFlag('audiotube_enabled', true);
   // Set localStorage.audiotube_debug = '1' in the page console and reload.
   const debug = () => readFlag('audiotube_debug', false);
 
@@ -40,6 +42,10 @@
 
   if (!window.MediaSource) return;
 
+  // Tell bridge.js (isolated world, shares the DOM) which mode this frame
+  // actually started in, so it can decide whether a reload is needed.
+  if (document.documentElement) document.documentElement.dataset.audiotubeActive = ENABLED ? '1' : '0';
+
   // ---------------------------------------------------------------------------
   // Fake video SourceBuffer
   // ---------------------------------------------------------------------------
@@ -51,6 +57,7 @@
       super();
       this._mediaSource = mediaSource;
       this._updating = false;
+      this._timer = 0;
       this._handlers = {};
       this.mode = 'segments';
       this.timestampOffset = 0;
@@ -78,9 +85,11 @@
     }
 
     _completeAsync() {
+      if (this._updating) throw new DOMException('SourceBuffer is updating', 'InvalidStateError');
       this._updating = true;
       this.dispatchEvent(new Event('updatestart'));
-      setTimeout(() => {
+      this._timer = setTimeout(() => {
+        this._timer = 0;
         this._updating = false;
         this.dispatchEvent(new Event('update'));
         this.dispatchEvent(new Event('updateend'));
@@ -89,7 +98,16 @@
 
     appendBuffer() { this._completeAsync(); }
     remove() { this._completeAsync(); }
-    abort() { this._updating = false; }
+
+    // Per spec: cancel a pending update and fire abort + updateend (no update).
+    abort() {
+      if (!this._updating) return;
+      clearTimeout(this._timer);
+      this._timer = 0;
+      this._updating = false;
+      this.dispatchEvent(new Event('abort'));
+      this.dispatchEvent(new Event('updateend'));
+    }
     changeType() {}
   }
 
@@ -107,7 +125,7 @@
 
   const nativeAddSourceBuffer = MediaSource.prototype.addSourceBuffer;
   MediaSource.prototype.addSourceBuffer = function (type) {
-    if (enabled() && typeof type === 'string' && /^video\//i.test(type)) {
+    if (ENABLED && typeof type === 'string' && /^video\//i.test(type)) {
       if (debug()) console.log(TAG, 'fake SourceBuffer for', type);
       return new FakeSourceBuffer(this);
     }
@@ -220,9 +238,11 @@
     if (!fields) return null;
 
     const isTrackTypes = (f) => f.num === ENABLED_TRACK_TYPES && f.wire === 0;
-    const existing = fields.find(isTrackTypes);
+    const matches = fields.filter(isTrackTypes);
+    const existing = matches.length === 1 ? matches[0] : null;
 
     // Common case: overwrite the single value byte in place. Size-preserving.
+    // With repeated fields the last one wins, so those go through the rebuild.
     if (existing && existing.dataEnd - existing.dataStart === 1) {
       const out = bytes.slice();
       out[abr.dataStart + existing.dataStart] = TRACK_TYPES_AUDIO_ONLY;
@@ -249,15 +269,22 @@
     return null;
   }
 
-  function isSabrRequest(input) {
+  // Returns 'sabr' for a SABR videoplayback request, 'plain' for any other
+  // videoplayback request, null otherwise.
+  function classifyRequest(input) {
     try {
       const raw = input instanceof Request ? input.url : String(input);
-      if (!raw.includes('/videoplayback')) return false;
-      return new URL(raw, location.href).searchParams.get('sabr') === '1';
+      if (!raw.includes('/videoplayback')) return null;
+      return new URL(raw, location.href).searchParams.get('sabr') === '1' ? 'sabr' : 'plain';
     } catch {
-      return false;
+      return null;
     }
   }
+
+  // Video segments that bypass the SABR patch still get downloaded, then
+  // thrown away by the fake SourceBuffer: no picture and no savings.
+  const warnUnpatched = () =>
+    warnOnce('Unpatched videoplayback request (non-SABR or XHR); video is downloaded and discarded.');
 
   const nativeFetch = window.fetch;
 
@@ -294,9 +321,21 @@
   }
 
   window.fetch = function (input, init) {
-    if (enabled() && isSabrRequest(input)) return fetchPatched(input, init);
+    if (ENABLED) {
+      const kind = classifyRequest(input);
+      if (kind === 'sabr') return fetchPatched(input, init);
+      if (kind === 'plain') warnUnpatched();
+    }
     return nativeFetch.apply(this, arguments);
   };
+
+  if (ENABLED && window.XMLHttpRequest) {
+    const nativeOpen = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function (method, url) {
+      if (classifyRequest(url)) warnUnpatched();
+      return nativeOpen.apply(this, arguments);
+    };
+  }
 
   // ---------------------------------------------------------------------------
   // Debug helpers (only active with localStorage.audiotube_debug = '1')
@@ -383,5 +422,5 @@
       .catch(() => {});
   }
 
-  if (debug()) console.log(TAG, 'initialised, enabled =', enabled());
+  if (debug()) console.log(TAG, 'initialised, enabled =', ENABLED);
 })();
